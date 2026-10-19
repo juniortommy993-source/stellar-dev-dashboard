@@ -1,0 +1,18 @@
+{
+  "default_branch": "master",
+  "branches": [
+    "master",
+    "origin",
+    "security/issue-1196-2026-wallet-redact-wallet-errors-before"
+  ],
+  "parent": {
+    "master": null,
+    "origin": "master",
+    "security/issue-1196-2026-wallet-redact-wallet-errors-before": "master"
+  },
+  "order": [
+    "master",
+    "origin",
+    "security/issue-1196-2026-wallet-redact-wallet-errors-before"
+  ]
+}
