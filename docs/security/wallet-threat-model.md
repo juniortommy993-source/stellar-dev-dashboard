@@ -1,5 +1,7 @@
 # Threat Model: Freighter & Ledger Wallet Flows
 
+> **Status:** This document is the authoritative reference for wallet error redaction. See §6 for the redaction contract that governs telemetry and user-facing export paths. The redaction pipeline lives in `src/lib/wallet/redaction.ts` (module `wallet/redaction`); the legacy path `src/lib/wallet/errorRedaction` referenced in earlier drafts is superseded.
+
 This document details the threat model, trust boundaries, failure handling, and developer guidance for browser extension (`Freighter`) and hardware wallet (`Ledger`) integration within the `stellar-dev-dashboard` (#841).
 
 ---
@@ -88,6 +90,45 @@ The dashboard interfaces with decentralized key-management providers to execute 
 
 ---
 
+## 6. Wallet Error Redaction (Telemetry & User Export)
+
+Wallet errors frequently carry sensitive material: raw XDR envelopes, signed transaction hashes, full public keys, derivation paths, APDU hex payloads, and provider stack traces. Before any wallet error leaves the dashboard boundary — whether to telemetry (`src/lib/errorTracking`) or to a user-initiated export — it MUST pass through the redaction pipeline in `src/lib/wallet/errorRedaction`.
+
+### 6.1 Redaction Contract
+
+All wallet errors are normalized to a `RedactedWalletError` shape before telemetry or export:
+
+| Field | Policy |
+| :---- | :----- |
+| `code` | Preserved verbatim (allowlisted enum: `INVALID_PUBLIC_KEY`, `USER_REJECTED`, `DEVICE_LOCKED`, `APP_NOT_OPEN`, `TRANSPORT_DISCONNECT`, `NETWORK_MISMATCH`, `UNSUPPORTED_ENVIRONMENT`, `UNKNOWN`). |
+| `message` | Replaced with a static, code-derived string. Raw provider messages are never forwarded. |
+| `publicKey` | Truncated to first 4 and last 4 characters (`GABC…WXYZ`); full key never emitted. |
+| `xdr` / `signedXdr` | Fully removed. A boolean `hasXdr: true` flag may be recorded. |
+| `derivationPath` | Reduced to `44'/148'/<redacted>`; account index removed. |
+| `apdu` / `rawResponse` | Fully removed. |
+| `stack` | Dropped for telemetry; retained only in local dev builds behind `NODE_ENV !== 'production'`. |
+| `cause` | Recursively redacted; unknown fields dropped. |
+
+### 6.2 Enforcement Points
+
+- **Telemetry:** `reportWalletError()` in `src/lib/errorTracking` calls `redactWalletError()` (from `src/lib/wallet/redaction`) before enqueueing. A unit test asserts that no raw XDR, full public key, or derivation index appears in the serialized payload.
+- **User Export:** The "Export diagnostics" action in the wallet settings panel serializes only `RedactedWalletError` objects. Export is gated behind an explicit confirmation dialog that states what fields are included.
+- **Logging:** `console.*` calls in wallet modules MUST log the redacted form. A lint rule (`no-restricted-syntax`) flags direct logging of raw wallet error objects.
+
+### 6.3 Failure & Recovery Paths
+
+- If `redactWalletError()` throws (e.g., cyclic `cause`), the pipeline falls back to a minimal `{ code: 'UNKNOWN', message: 'Wallet error (details withheld)' }` record and emits a `redaction_failure` metric. The original error is never emitted as a fallback.
+- Redaction is idempotent: re-redacting a `RedactedWalletError` returns an equivalent object.
+- Boundary case: errors with `undefined`/`null` `cause` chains and errors that are plain strings are both handled without throwing.
+
+### 6.4 Privacy & Security Notes
+
+- Redaction is a defense-in-depth control, not a substitute for never logging secrets. Wallet modules must not attach raw XDR or keys to error objects in the first place where avoidable.
+- Telemetry payloads are covered by the same retention policy as other error events; redaction ensures no wallet-specific PII enters that store.
+- User export is local-only (no network egress) and is documented in the wallet settings UI.
+
+---
+
 ## 4. E2E Wallet Fixtures (`tests/e2e/fixtures/`)
 
 To support automated end-to-end verification of threat vectors and security paths, the test suite provides deterministic mock providers that simulate both normal and hostile wallet behavior:
@@ -103,6 +144,8 @@ To support automated end-to-end verification of threat vectors and security path
    - Simulates hardware lock state (`0x6b0c`), app-closed state (`0x6d00`), and user rejection (`0x6985`).
    - Simulates firmware version checks (vulnerabilities vs. secure firmware).
 
+3. **`wallet-error-redaction.test.ts`** (unit): Asserts the redaction contract in §6.1 for happy path, boundary (null/cyclic `cause`, string errors), and failure (redaction throws → minimal fallback) cases.
+
 ---
 
 ## 5. Compatibility & Migration Notes
@@ -110,3 +153,5 @@ To support automated end-to-end verification of threat vectors and security path
 - **Freighter API Compatibility:** Compatible with `@stellar/freighter-api` v1 and v2 methods (`isConnected`, `isAllowed`, `setAllowed`, `requestAccess`, `getAddress`, `getNetwork`, `signTransaction`, `getUserInfo`).
 - **Ledger Transports:** WebUSB (`@ledgerhq/hw-transport-webusb`) is preferred; WebHID (`@ledgerhq/hw-transport-webhid`) acts as fallback on Chromium 89+.
 - **Zero-Dependency Core:** Transports for hardware wallets remain optional dynamic peer dependencies so browser bundle size is not penalized when hardware signing is unused.
+
+**Verification:** `pnpm test src/lib/wallet/redaction src/lib/errorTracking` and `pnpm test:e2e --grep wallet-error-redaction`. Manual: trigger a user rejection, inspect the exported diagnostics JSON, and confirm no XDR, full public key, or derivation index is present.
